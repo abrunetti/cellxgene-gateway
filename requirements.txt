@@ -4,3 +4,4 @@ flask-api==2.0
 werkzeug==1.0.1
 psutil
 requests
+pyrebase4

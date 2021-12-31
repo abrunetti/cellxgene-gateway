@@ -11,7 +11,11 @@ import json
 import logging
 import os
 import urllib.parse
+import sys
 from threading import Lock, Thread
+
+import pyrebase
+
 
 from flask import (
     Flask,
@@ -21,6 +25,7 @@ from flask import (
     request,
     send_from_directory,
     url_for,
+    session,
 )
 from flask_api import status
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -38,6 +43,24 @@ from cellxgene_gateway.prune_process_cache import PruneProcessCache
 from cellxgene_gateway.util import current_time_stamp
 
 app = Flask(__name__)
+app.secret_key = 'SECRETKEY'
+
+firebaseConfig = {
+    "apiKey": "AIzaSyAbVsp_yncWsCEtUF1ot2bouyjtIXByet4",
+    "authDomain": "single-cell-itb.firebaseapp.com",
+    "projectId": "single-cell-itb",
+    "storageBucket": "single-cell-itb.appspot.com",
+    "messagingSenderId": "565622013976",
+    "appId": "1:565622013976:web:6607b4789bb226f1b4036d",
+    "measurementId": "G-5GYLLTEK18",
+    "databaseURL": "https://single-cell-itb-default-rtdb.europe-west1.firebasedatabase.app/"
+}
+
+firebase = pyrebase.initialize_app(config=firebaseConfig)
+auth = firebase.auth()
+
+#Initialze person as dictionary
+person = {"is_logged_in": False, "name": "", "email": "", "uid": ""}
 
 item_sources = []
 default_item_source = None
@@ -129,44 +152,77 @@ def favicon():
     )
 
 
+@app.route("/login.html", methods=["GET", "POST"])
+def login():
+    if request.method == 'POST':
+        email = request.form['uname']
+        password = request.form['pword']
+        try:
+            auth.sign_in_with_email_and_password(email, password)
+            session['username'] = email
+            session['loggedin'] = True
+            return redirect(url_for('index'))
+        except Exception as e:
+            #print(e)
+            return render_template("login.html");
+    else:
+        return render_template("login.html");
+
+
 @app.route("/")
 def index():
-    return render_template(
-        "index.html",
-        ip=env.ip,
-        cellxgene_data=env.cellxgene_data,
-        extra_scripts=get_extra_scripts(),
-    )
+    if ("loggedin" not in session or session['loggedin'] == False):
+        session['loggedin'] = False
+        return redirect(url_for('login'))
+    else:
+        return render_template(
+            "index.html",
+            ip=env.ip,
+            cellxgene_data=env.cellxgene_data,
+            extra_scripts=get_extra_scripts(),
+        )
+
+@app.route("/logout")
+def logout():
+    session.pop('username', None)
+    session.pop('loggedin', None)
+    return redirect(url_for('login'))
 
 
 @app.route("/filecrawl.html")
 @app.route("/filecrawl/<path:path>")
 def filecrawl(path=None):
-    source_name = request.args.get("source")
-    sources = (
-        filter(
-            lambda x: x.name == urllib.parse.unquote_plus(source_name),
-            item_sources,
+    if ("loggedin" not in session or session['loggedin'] == False):
+        session['loggedin'] = False
+        return redirect(url_for('login'))
+    else:
+        source_name = request.args.get("source")
+        print(source_name, file=sys.stderr)
+        sources = (
+            filter(
+                lambda x: x.name == urllib.parse.unquote_plus(source_name),
+                item_sources,
+            )
+            if source_name
+            else item_sources
         )
-        if source_name
-        else item_sources
-    )
-    # loop all data sources --
-    rendered_sources = [
-        render_item_source(item_source, path) for item_source in sources
-    ]  # will we need to make this async in the page???
-    rendered_html = "\n".join(rendered_sources)
+        # loop all data sources --
+        rendered_sources = [
+            render_item_source(item_source, path) for item_source in sources
+        ]  # will we need to make this async in the page???
+        print(rendered_sources, file=sys.stderr)
+        rendered_html = "\n".join(rendered_sources)
 
-    resp = make_response(
-        render_template(
-            "filecrawl.html",
-            extra_scripts=get_extra_scripts(),
-            rendered_html=rendered_html,
-            path=path,
+        resp = make_response(
+            render_template(
+                "filecrawl.html",
+                extra_scripts=get_extra_scripts(),
+                rendered_html=rendered_html,
+                path=path,
+            )
         )
-    )
-    set_no_cache(resp)
-    return resp
+        set_no_cache(resp)
+        return resp
 
 
 entry_lock = Lock()
@@ -188,97 +244,121 @@ def matching_source(source_name):
 )
 @app.route("/view/<path:path>", methods=["GET", "PUT", "POST"])
 def do_view(path, source_name=None):
-    source = matching_source(source_name)
-    match = cache.check_path(source, path)
+    if ("loggedin" not in session or session['loggedin'] == False):
+        session['loggedin'] = False
+        return redirect(url_for('login'))
+    else:
+        source = matching_source(source_name)
+        match = cache.check_path(source, path)
 
-    if match is None:
-        lookup = source.lookup(path)
-        if lookup is None:
-            raise CellxgeneException(
-                f"Could not find item for path {path} in source {source.name}",
-                404,
+        if match is None:
+            lookup = source.lookup(path)
+            if lookup is None:
+                raise CellxgeneException(
+                    f"Could not find item for path {path} in source {source.name}",
+                    404,
+                )
+            key = CacheKey.for_lookup(source, lookup)
+            print(
+                f"view path={path}, source_name={source_name}, dataset={key.file_path}, annotation_file= {key.annotation_file_path}, key={key.descriptor}, source={key.source_name}"
             )
-        key = CacheKey.for_lookup(source, lookup)
-        print(
-            f"view path={path}, source_name={source_name}, dataset={key.file_path}, annotation_file= {key.annotation_file_path}, key={key.descriptor}, source={key.source_name}"
-        )
-        with entry_lock:
-            match = cache.check_entry(key)
-            if match is None:
-                uascripts = get_extra_scripts()
-                match = cache.create_entry(key, uascripts)
+            with entry_lock:
+                match = cache.check_entry(key)
+                if match is None:
+                    uascripts = get_extra_scripts()
+                    match = cache.create_entry(key, uascripts)
 
-    match.timestamp = current_time_stamp()
+        match.timestamp = current_time_stamp()
 
-    if (
-        match.status == CacheEntryStatus.loaded
-        or match.status == CacheEntryStatus.loading
-    ):
-        if source.is_authorized(match.key.descriptor):
-            return match.serve_content(path)
-        else:
-            raise CellxgeneException("User not authorized to access this data", 403)
-    elif match.status == CacheEntryStatus.error:
-        raise ProcessException.from_cache_entry(match)
+        if (
+            match.status == CacheEntryStatus.loaded
+            or match.status == CacheEntryStatus.loading
+        ):
+            if source.is_authorized(match.key.descriptor):
+                return match.serve_content(path)
+            else:
+                raise CellxgeneException("User not authorized to access this data", 403)
+        elif match.status == CacheEntryStatus.error:
+            raise ProcessException.from_cache_entry(match)
 
 
 @app.route("/cache_status", methods=["GET"])
 def do_GET_status():
-    return render_template(
-        "cache_status.html",
-        entry_list=cache.entry_list,
-        extra_scripts=get_extra_scripts(),
-    )
+    if ("loggedin" not in session or session['loggedin'] == False):
+        session['loggedin'] = False
+        return redirect(url_for('login'))
+    else:
+        return render_template(
+            "cache_status.html",
+            entry_list=cache.entry_list,
+            extra_scripts=get_extra_scripts(),
+        )
 
 
 @app.route("/cache_status.json", methods=["GET"])
 def do_GET_status_json():
-    return json.dumps(
-        {
-            "launchtime": app.launchtime,
-            "entry_list": [
-                {
-                    "dataset": entry.key.dataset,
-                    "annotation_file": entry.key.annotation_file,
-                    "launchtime": entry.launchtime,
-                    "last_access": entry.timestamp,
-                    "status": entry.status,
-                }
-                for entry in cache.entry_list
-            ],
-        }
-    )
+    if ("loggedin" not in session or session['loggedin'] == False):
+        session['loggedin'] = False
+        return redirect(url_for('login'))
+    else:
+        return json.dumps(
+            {
+                "launchtime": app.launchtime,
+                "entry_list": [
+                    {
+                        "dataset": entry.key.dataset,
+                        "annotation_file": entry.key.annotation_file,
+                        "launchtime": entry.launchtime,
+                        "last_access": entry.timestamp,
+                        "status": entry.status,
+                    }
+                    for entry in cache.entry_list
+                ],
+            }
+        )
 
 
 @app.route("/relaunch/<path:path>", methods=["GET"])
 def do_relaunch(path):
-    source_name = request.args.get("source_name") or default_item_source.name
-    source = matching_source(source_name)
-    key = CacheKey.for_lookup(source, source.lookup(path))
-    match = cache.check_entry(key)
-    if not match is None:
-        match.terminate()
-    return redirect(
-        key.view_url,
-        code=302,
-    )
+    if ("loggedin" not in session or session['loggedin'] == False):
+        session['loggedin'] = False
+        return redirect(url_for('login'))
+    else:
+        source_name = request.args.get("source_name") or default_item_source.name
+        source = matching_source(source_name)
+        key = CacheKey.for_lookup(source, source.lookup(path))
+        match = cache.check_entry(key)
+        if not match is None:
+            match.terminate()
+        return redirect(
+            key.view_url,
+            code=302,
+        )
 
 
 @app.route("/terminate/<path:path>", methods=["GET"])
 def do_terminate(path):
-    source_name = request.args.get("source_name") or default_item_source.name
-    source = matching_source(source_name)
-    key = CacheKey.for_lookup(source, source.lookup(path))
-    match = cache.check_entry(key)
-    if not match is None:
-        match.terminate()
-    return redirect(url_for("do_GET_status"), code=302)
+    if ("loggedin" not in session or session['loggedin'] == False):
+        session['loggedin'] = False
+        return redirect(url_for('login'))
+    else:
+        source_name = request.args.get("source_name") or default_item_source.name
+        source = matching_source(source_name)
+        key = CacheKey.for_lookup(source, source.lookup(path))
+        match = cache.check_entry(key)
+        if not match is None:
+            match.terminate()
+        return redirect(url_for("do_GET_status"), code=302)
 
 
 @app.route("/metadata/ip_address", methods=["GET"])
 def ip_address():
-    resp = make_response(env.ip)
-    return set_no_cache(resp)
+    if ("loggedin" not in session or session['loggedin'] == False):
+        session['loggedin'] = False
+        return redirect(url_for('login'))
+    else:
+        resp = make_response(env.ip)
+        return set_no_cache(resp)
 
 
 def launch():
@@ -296,7 +376,7 @@ def launch():
     background_thread.start()
 
     app.launchtime = current_time_stamp()
-    app.run(host="0.0.0.0", port=env.gateway_port, debug=False)
+    
 
 
 def main():
@@ -304,7 +384,8 @@ def main():
         level=logging.INFO,
         format="%(asctime)s:%(name)s:%(levelname)s:%(message)s",
     )
-    cellxgene_data = os.environ.get("CELLXGENE_DATA", None)
+    # TODO: Modificare
+    cellxgene_data = "/home/antonio/cellxgene_data"
     cellxgene_bucket = os.environ.get("CELLXGENE_BUCKET", None)
 
     if cellxgene_bucket is not None:
@@ -324,5 +405,9 @@ def main():
     launch()
 
 
+main()
+
+# Never called in flask production mode
 if __name__ == "__main__":
     main()
+    app.run(host="0.0.0.0", port=env.gateway_port, debug=False)
